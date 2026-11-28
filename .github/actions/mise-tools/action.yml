@@ -10,14 +10,19 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+    # Restore and save in separate steps so the entry is saved right after
+    # `mise install` and holds only the repo's tools. A post-job save would also
+    # capture whatever the job installs later; the Windows e2e tests install into
+    # this data dir and made each entry about 2.8 GB.
+    # ~/.cache/mise is left out: install deletes its downloads, and the rest
+    # (version lists, aube's store) is regenerated when needed.
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      id: restore
       if: inputs.cache == 'true'
       with:
         key: ${{ runner.os }}-${{ runner.arch }}-mise-tools-${{ hashFiles('mise.lock') }}
         restore-keys: ${{ runner.os }}-${{ runner.arch }}-mise-tools-
-        path: |
-          ~/.local/share/mise
-          ~/.cache/mise
+        path: ~/.local/share/mise
     # Check the API directly instead of bootstrapping the rate-limit helper,
     # since installing the helper itself requires GitHub API access.
     - name: Wait for GitHub rate limit
@@ -45,3 +50,10 @@ runs:
         fi
     - run: mise install
       shell: bash
+    # Only on a primary-key miss: a hit already holds these tools, and the key
+    # changes whenever mise.lock does.
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      if: inputs.cache == 'true' && steps.restore.outputs.cache-hit != 'true'
+      with:
+        key: ${{ steps.restore.outputs.cache-primary-key }}
+        path: ~/.local/share/mise
