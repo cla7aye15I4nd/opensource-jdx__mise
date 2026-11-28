@@ -5,6 +5,13 @@ on:
       trusted:
         required: true
         type: boolean
+      # Run the Windows jobs on windows-latest whatever the self-hosted queue looks like,
+      # and save their rust-cache on main. windows-cache.yml sets it so the hosted
+      # fallback has a cache to restore.
+      windows-hosted:
+        required: false
+        type: boolean
+        default: false
     secrets:
       FORGEJO_TOKEN:
         required: false
@@ -94,14 +101,15 @@ jobs:
           echo "deps-changed=$deps_changed" >> "$GITHUB_OUTPUT"
 
       # Windows jobs use the self-hosted pool only for trusted runs with
-      # WINDOWS_SELF_HOSTED=true. This step is the default and makes no API call.
+      # WINDOWS_SELF_HOSTED=true that did not ask for hosted runners. This step is the
+      # default and makes no API call.
       - name: Choose Windows runner
         id: windows-runner
         env:
-          SELF_HOSTED: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && 'true' || 'false' }}
+          SELF_HOSTED: ${{ inputs.trusted && !inputs.windows-hosted && vars.WINDOWS_SELF_HOSTED == 'true' && 'true' || 'false' }}
         run: |
           echo "windows-self-hosted=$SELF_HOSTED" >> "$GITHUB_OUTPUT"
-          echo "Windows jobs: self-hosted=$SELF_HOSTED (trusted=${{ inputs.trusted }}, WINDOWS_SELF_HOSTED=${{ vars.WINDOWS_SELF_HOSTED }})"
+          echo "Windows jobs: self-hosted=$SELF_HOSTED (trusted=${{ inputs.trusted }}, windows-hosted=${{ inputs.windows-hosted }}, WINDOWS_SELF_HOSTED=${{ vars.WINDOWS_SELF_HOSTED }})"
 
       # Overflow to hosted runners when the self-hosted queue is deep. GitHub has no
       # "queued jobs by label" API and listing runners needs admin rights, so walk the
@@ -116,7 +124,7 @@ jobs:
       # Only API data is used here; nothing from the checkout runs with this token.
       - name: Check Windows queue depth
         id: windows-queue
-        if: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' }}
+        if: ${{ inputs.trusted && !inputs.windows-hosted && vars.WINDOWS_SELF_HOSTED == 'true' }}
         continue-on-error: true
         timeout-minutes: 2
         env:
@@ -232,7 +240,8 @@ jobs:
         if: ${{ needs.classify-changes.outputs.windows-self-hosted != 'true' }}
         with:
           shared-key: build-windows
-          save-if: ${{ inputs.trusted && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+          # Pushes to main rarely overflow to hosted runners, so windows-cache.yml saves this too.
+          save-if: ${{ inputs.trusted && ((github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v'))) || (inputs.windows-hosted && github.ref == 'refs/heads/main')) }}
       - shell: pwsh
         run: |
           ${{ needs.classify-changes.outputs.windows-self-hosted == 'true' && 'mbx' || 'cargo' }} build --no-default-features --features rustls-native-roots,vfox/vendored-lua,self_update --all-targets
@@ -602,7 +611,8 @@ jobs:
         if: ${{ needs.classify-changes.outputs.windows-self-hosted != 'true' }}
         with:
           shared-key: windows-unit
-          save-if: ${{ inputs.trusted && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+          # Pushes to main rarely overflow to hosted runners, so windows-cache.yml saves this too.
+          save-if: ${{ inputs.trusted && ((github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v'))) || (inputs.windows-hosted && github.ref == 'refs/heads/main')) }}
       - name: cargo test
         uses: jdx/workflows/retry@7e4ea6cf326e2b3bb4335f733381af531aaa699d # v1.2.1
         with:
@@ -635,7 +645,8 @@ jobs:
         if: ${{ needs.classify-changes.outputs.windows-self-hosted != 'true' }}
         with:
           shared-key: windows-lint
-          save-if: ${{ inputs.trusted && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+          # Pushes to main rarely overflow to hosted runners, so windows-cache.yml saves this too.
+          save-if: ${{ inputs.trusted && ((github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v'))) || (inputs.windows-hosted && github.ref == 'refs/heads/main')) }}
       - run: rustup component add clippy
       # Retried once like windows-unit: the self-hosted runner has failed this step
       # about once in 120 runs with a transient "directory name is invalid" (os error 267).

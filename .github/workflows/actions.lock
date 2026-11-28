@@ -126,6 +126,7 @@ workflows:
         - 'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333'
         - 'jdx/mise-action@90f833d396d0cc3674b631d2d225e306476c303a'
     '.github/workflows/vendored-file-warning.yml': []
+    '.github/workflows/windows-cache.yml': []
     '.github/workflows/winget.yml': []
 dependencies:
     'actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8':
