@@ -83,8 +83,8 @@ impl Backend for GoBackend {
     }
 
     async fn remote_version_cache_context(&self, config: &Arc<Config>) -> Result<Option<String>> {
-        let env = self.go_routing_env(config).await?;
-        Ok(go_routing_cache_context(&env))
+        let (env, routing) = self.go_routing_settings(config).await?;
+        Ok(go_routing_cache_context(&user_go_routing(env, routing)))
     }
 
     /// List Go module versions through the configured proxy or Go's module command.
@@ -692,13 +692,29 @@ impl GoBackend {
         })
     }
 
+    /// The `go` that version lookups run (see [`lookup_go_program`]).
+    async fn lookup_go(&self, config: &Arc<Config>) -> std::ffi::OsString {
+        lookup_go_program(self.spawn_program(config, None, "go").await)
+    }
+
+    /// mise's own environment, and the module routing settings Go reads in it,
+    /// including those saved with `go env -w` (see [`effective_go_routing`]),
+    /// or `None` when `go` could not say.
+    async fn go_routing_settings(
+        &self,
+        config: &Arc<Config>,
+    ) -> eyre::Result<(BTreeMap<String, String>, Option<BTreeMap<String, String>>)> {
+        let env = self.dependency_env(config).await?;
+        let go = self.lookup_go(config).await;
+        let routing = effective_go_routing(&go, &env, GO_ENV_DEADLINE).await;
+        Ok((env, routing))
+    }
+
     /// The environment for every lookup of versions and their dates: mise's
-    /// own, with the module routing settings as Go reads them, including those
-    /// saved with `go env -w` (see [`effective_go_routing`]).
+    /// own, with the module routing settings as Go reads them, and no route to
+    /// `direct` when Go could not say what they are (see [`apply_go_routing`]).
     async fn go_routing_env(&self, config: &Arc<Config>) -> eyre::Result<BTreeMap<String, String>> {
-        let mut env = self.dependency_env(config).await?;
-        let go = self.spawn_program(config, None, "go").await;
-        let routing = effective_go_routing(&go, &env).await;
+        let (mut env, routing) = self.go_routing_settings(config).await?;
         apply_go_routing(&mut env, routing);
         Ok(env)
     }
@@ -733,7 +749,7 @@ impl GoBackend {
         config: &Arc<Config>,
         mod_path: &str,
     ) -> eyre::Result<Option<Vec<VersionInfo>>> {
-        let go = self.spawn_program(config, None, "go").await;
+        let go = self.lookup_go(config).await;
         let raw = match go_list(
             &go,
             &[
@@ -807,7 +823,7 @@ impl GoBackend {
         // leaves those versions with defaults rather than failing the listing — so without
         // this the whole enrichment step would silently no-op on a Windows go that is not
         // spawnable by bare name.
-        let go = self.spawn_program(config, None, "go").await;
+        let go = self.lookup_go(config).await;
 
         // `go list -m -versions` orders versions ascending, so the newest ones
         // are at the end; everything before them stays undated.
@@ -860,7 +876,7 @@ impl GoBackend {
         version: &str,
     ) -> eyre::Result<GoModuleVersionMetadata> {
         let env = self.go_list_env(config).await?;
-        let go = self.spawn_program(config, None, "go").await;
+        let go = self.lookup_go(config).await;
         let target = format!("{mod_path}@{version}");
         let raw = go_list(
             &go,
@@ -932,7 +948,7 @@ impl GoBackend {
         mod_path: &str,
     ) -> eyre::Result<Option<Vec<VersionInfo>>> {
         let env = self.go_list_env(config).await?;
-        let go = self.spawn_program(config, None, "go").await;
+        let go = self.lookup_go(config).await;
         let latest = format!("{mod_path}@latest");
         let raw = go_list(
             &go,
@@ -970,16 +986,13 @@ async fn go_list(go: &OsStr, args: &[&str], env: &BTreeMap<String, String>) -> R
     if std::fs::read_to_string(&go_mod).ok().as_deref() != Some(GO_META_MOD) {
         crate::file::write_atomic(&go_mod, GO_META_MOD)?;
     }
-    // `go` itself is found here, against the directory mise runs in, as the
-    // user's shell would find it. What `go` starts in turn (`git` and the
-    // other version-control tools it fetches modules with) comes from a PATH
-    // of the absolute entries alone: a relative entry names a directory in
+    // `go` itself, and what it starts in turn (`git` and the other
+    // version-control tools it fetches modules with), come from the absolute
+    // PATH entries alone: a relative or empty entry names a directory in
     // whatever checkout mise runs in, and Go refuses to run a tool found
-    // through one.
-    let program = match std::env::current_dir() {
-        Ok(cwd) => program_outside_cwd(go, env, &cwd),
-        Err(_) => go.to_os_string(),
-    };
+    // through one. Version lookups, and the `go env` that picks their route,
+    // run on any listing, so a checkout must not be able to supply the `go`.
+    let program = go_program(go, env)?;
     let mut cmd = tokio::process::Command::new(program);
     cmd.env_clear().envs(env);
     if let Some((key, search)) = absolute_search_path(env) {
@@ -987,6 +1000,36 @@ async fn go_list(go: &OsStr, args: &[&str], env: &BTreeMap<String, String>) -> R
     }
     cmd.current_dir(&dir);
     crate::cmd::cmd_read_async_command(cmd, &go.to_string_lossy(), args).await
+}
+
+/// The `go` that version lookups run: one that `spawn_program` found at an
+/// absolute path (the toolset's, on Windows), or else the bare name, which
+/// [`go_program`] looks up in the absolute PATH entries alone.
+///
+/// On Windows `spawn_program` also searches the PATH mise was started with,
+/// relative entries included, and can return a checkout's `bin\go.exe`; such
+/// a result is dropped for the bare name, so the lookup cannot run it.
+fn lookup_go_program(spawnable: std::ffi::OsString) -> std::ffi::OsString {
+    let path = std::path::Path::new(&spawnable);
+    if path.is_absolute() || is_bare_program_name(path) {
+        spawnable
+    } else {
+        debug!(
+            "not running go at {}, which is not an absolute path",
+            path.display()
+        );
+        std::ffi::OsString::from("go")
+    }
+}
+
+/// A program name with no directory part, root or drive (`go`, `go.exe`),
+/// which is looked up in PATH. `C:go.exe` and `\go.exe` are not bare: on
+/// Windows they are read against a current directory.
+fn is_bare_program_name(path: &std::path::Path) -> bool {
+    matches!(
+        path.components().collect::<Vec<_>>().as_slice(),
+        [std::path::Component::Normal(_)]
+    )
 }
 
 /// `env`'s PATH entry, whatever the case of its name (Windows reads `Path`).
@@ -1006,30 +1049,35 @@ fn absolute_search_path(env: &BTreeMap<String, String>) -> Option<(&String, std:
     Some((key, search))
 }
 
-/// `program` as a path that names the same executable once the child runs in
-/// another directory: a relative `program` would be read against the new
-/// directory instead of `cwd`. A bare name is looked up in `env`'s PATH read
-/// against `cwd`, and one found in no entry is returned as it is, for the
-/// child to report.
-fn program_outside_cwd(
-    program: &OsStr,
-    env: &BTreeMap<String, String>,
-    cwd: &std::path::Path,
-) -> std::ffi::OsString {
+/// `program` as an absolute path to start in another directory.
+///
+/// An absolute path is kept. A bare name is looked up in the absolute entries
+/// of `env`'s PATH, the way execvp would look; it is never left for the OS to
+/// look up, which would read relative and empty entries against the current
+/// directory. A relative path with a directory part (`bin/go`, or `bin\go.exe`
+/// found through a relative PATH entry on Windows) names a file of the
+/// checkout mise runs in, and is refused.
+fn go_program(program: &OsStr, env: &BTreeMap<String, String>) -> Result<std::ffi::OsString> {
     let path = std::path::Path::new(program);
     if path.is_absolute() {
-        return program.to_os_string();
+        return Ok(program.to_os_string());
     }
-    if path.components().count() > 1 {
-        return cwd.join(path).into_os_string();
+    if !is_bare_program_name(path) {
+        return Err(eyre!(
+            "{} is not an absolute path, and go is only run from one",
+            path.display()
+        ));
     }
-    let Some((_, search)) = search_path(env) else {
-        return program.to_os_string();
+    let not_found = || {
+        eyre!(
+            "{} was not found in an absolute PATH entry",
+            program.to_string_lossy()
+        )
     };
+    let (_, search) = search_path(env).ok_or_else(not_found)?;
     let names = crate::file::executable_names(&program.to_string_lossy());
     std::env::split_paths(search)
-        // An empty or relative entry means a directory below `cwd`.
-        .map(|dir| cwd.join(dir))
+        .filter(|dir| dir.is_absolute())
         .find_map(|dir| {
             names
                 .iter()
@@ -1042,10 +1090,8 @@ fn program_outside_cwd(
                         && may_execute(candidate)
                 })
         })
-        .map_or_else(
-            || program.to_os_string(),
-            std::path::PathBuf::into_os_string,
-        )
+        .map(std::path::PathBuf::into_os_string)
+        .ok_or_else(not_found)
 }
 
 /// Whether the OS lets this process execute `path`, as execvp asks before it
@@ -1649,17 +1695,25 @@ async fn query_proxy_version_metadata(
 /// The settings that decide where Go fetches a module from.
 const GO_ROUTING_SETTINGS: &[&str] = &["GOPROXY", "GOPRIVATE", "GONOPROXY"];
 
+/// How long `go env` may take to report the [`GO_ROUTING_SETTINGS`]. It reads
+/// a few files and answers in milliseconds; past this, the settings are taken
+/// as unknown rather than holding up the lookup, or a read of cached versions,
+/// that needs them.
+const GO_ENV_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What `go env -json` says the [`GO_ROUTING_SETTINGS`] are for `go` run with
-/// `env`, or `None` when it cannot say. Answers are kept for the process, by
-/// `go` and the environment it is given.
+/// `env`, or `None` when it cannot say within `deadline`. Answers are kept for
+/// the process, by `go` and the environment it is given.
 ///
 /// Go reads each setting from the environment, then from the file
 /// `go env -w` writes (`GOENV`, by default `go/env` in the user's config
 /// directory), then from `$GOROOT/go.env`, which a distribution may change.
 /// Asking the same `go` that mise runs follows all three, as only Go can.
+/// `go` is found as [`go_list`] finds it, in the absolute PATH entries alone.
 async fn effective_go_routing(
     go: &OsStr,
     env: &BTreeMap<String, String>,
+    deadline: std::time::Duration,
 ) -> Option<BTreeMap<String, String>> {
     type Answers = HashMap<String, Option<BTreeMap<String, String>>>;
     static ANSWERS: std::sync::LazyLock<std::sync::Mutex<Answers>> =
@@ -1675,10 +1729,15 @@ async fn effective_go_routing(
         .into_iter()
         .chain(GO_ROUTING_SETTINGS.iter().copied())
         .collect();
-    let answer = match go_list(go, &args, &go_env).await {
-        Ok(json) => parse_go_routing(&json),
-        Err(err) => {
+    // `go` is killed when its call is dropped at the deadline.
+    let answer = match tokio::time::timeout(deadline, go_list(go, &args, &go_env)).await {
+        Ok(Ok(json)) => parse_go_routing(&json),
+        Ok(Err(err)) => {
             debug!("go env could not report the module routing settings: {err:#}");
+            None
+        }
+        Err(_) => {
+            debug!("go env did not report the module routing settings within {deadline:?}");
             None
         }
     };
@@ -1698,10 +1757,26 @@ fn parse_go_routing(json: &str) -> Option<BTreeMap<String, String>> {
         .collect()
 }
 
+/// The routing settings as the user has them: mise's environment with what
+/// `go env` reported, or mise's environment alone when it could not say.
+///
+/// These choose the version cache entry and whether the versions host lists
+/// the tool. Without Go's answer, [`apply_go_routing`] also keeps the lookup
+/// itself off `direct`, but that guard is not a source of the user's: the
+/// default routing stays the default, served by the versions host.
+fn user_go_routing(
+    mut env: BTreeMap<String, String>,
+    routing: Option<BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    env.extend(routing.unwrap_or_default());
+    env
+}
+
 /// Put Go's own routing settings into `env`. Without them (`None`), mise cannot
 /// tell whether a saved setting keeps Go off `direct`, so every `direct` entry
-/// in GOPROXY becomes `off`: listing still asks the proxies, and nothing is
-/// fetched from version control that Go might not have fetched.
+/// is dropped from GOPROXY: listing still asks the proxies, all of them and in
+/// their order, and nothing is fetched from version control that Go might not
+/// have fetched. A chain of nothing but `direct` becomes `off`.
 fn apply_go_routing(env: &mut BTreeMap<String, String>, routing: Option<BTreeMap<String, String>>) {
     match routing {
         Some(routing) => env.extend(routing),
@@ -1711,23 +1786,38 @@ fn apply_go_routing(env: &mut BTreeMap<String, String>, routing: Option<BTreeMap
                 .filter(|s| !s.is_empty())
                 .map(String::as_str)
                 .unwrap_or(DEFAULT_GOPROXY);
-            let without_direct = goproxy
-                .split_inclusive([',', '|'])
-                .map(|entry| {
-                    let (name, sep) = match entry.strip_suffix([',', '|']) {
-                        Some(name) => (name, &entry[name.len()..]),
-                        None => (entry, ""),
-                    };
-                    if name.trim() == "direct" {
-                        format!("off{sep}")
-                    } else {
-                        entry.to_string()
-                    }
-                })
-                .collect();
-            env.insert("GOPROXY".to_string(), without_direct);
+            let goproxy = goproxy_without_direct(goproxy);
+            env.insert("GOPROXY".to_string(), goproxy);
         }
     }
+}
+
+/// `goproxy` with its `direct` entries left out. `off` would end the chain
+/// there, so it would drop the proxies after it too.
+///
+/// Each separator says how Go moves on from the entry before it (`,` past a
+/// 404 or 410, `|` past any error), so a kept entry keeps its own, and the
+/// last kept entry none.
+fn goproxy_without_direct(goproxy: &str) -> String {
+    let kept: Vec<(&str, &str)> = goproxy
+        .split_inclusive([',', '|'])
+        .map(|entry| match entry.strip_suffix([',', '|']) {
+            Some(name) => (name, &entry[name.len()..]),
+            None => (entry, ""),
+        })
+        .filter(|(name, _)| name.trim() != "direct")
+        .collect();
+    if kept.iter().all(|(name, _)| name.trim().is_empty()) {
+        return "off".to_string();
+    }
+    let mut chain = String::new();
+    for (i, (name, sep)) in kept.iter().enumerate() {
+        chain.push_str(name);
+        if i + 1 < kept.len() {
+            chain.push_str(sep);
+        }
+    }
+    chain
 }
 
 /// Parse the effective GOPROXY setting into ordered proxy endpoints.
@@ -1975,19 +2065,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn go_list_program_is_found_before_changing_directory() {
+    fn go_list_program_comes_from_absolute_path_entries() {
         use std::os::unix::fs::PermissionsExt;
 
         let work = tempfile::tempdir().unwrap();
         let cwd = work.path();
+        let abs = |dir: &str| cwd.join(dir).to_string_lossy().into_owned();
         let env_with = |path: &str| BTreeMap::from([("PATH".to_string(), path.to_string())]);
-        let resolve = |program: &str, path: &str| {
-            std::path::PathBuf::from(program_outside_cwd(
-                OsStr::new(program),
-                &env_with(path),
-                cwd,
-            ))
+        let try_resolve = |program: &str, path: &str| {
+            go_program(OsStr::new(program), &env_with(path)).map(std::path::PathBuf::from)
         };
+        let resolve = |program: &str, path: &str| try_resolve(program, path).unwrap();
         // Each `go` prints its mode and the PATH it was given.
         let script = |dir: &str, mode: u32| {
             let dir = cwd.join(dir);
@@ -1999,28 +2087,30 @@ mod tests {
         script("denied", 0o011);
         script("sdk/go/bin", 0o755);
 
-        // A relative path is read against the directory mise runs in, and an
-        // absolute one is kept.
-        assert_eq!(
-            resolve("sdk/go/bin/go", "/nonexistent"),
-            cwd.join("sdk/go/bin/go")
-        );
+        // An absolute path is kept.
         assert_eq!(
             resolve("/usr/bin/go", "sdk/go/bin"),
             std::path::PathBuf::from("/usr/bin/go")
         );
-        // A bare name is looked up there, the way execvp would, past a `go`
-        // this user may not execute (like one on a `noexec` mount). Only its
-        // owner's execute bit is clear, which stops the owner but not root.
+        // A bare name is looked up in the absolute entries, the way execvp
+        // would, past a `go` this user may not execute (like one on a
+        // `noexec` mount). Only its owner's execute bit is clear, which stops
+        // the owner but not root.
         let path = if nix::unistd::geteuid().is_root() {
-            "sdk/go/bin:/usr/bin:"
+            format!("{}:/nonexistent", abs("sdk/go/bin"))
         } else {
-            "denied:sdk/go/bin:/usr/bin:"
+            format!("{}:{}:/nonexistent", abs("denied"), abs("sdk/go/bin"))
         };
-        let program = resolve("go", path);
+        let program = resolve("go", &path);
         assert_eq!(program, cwd.join("sdk/go/bin/go"));
-        // Found nowhere, it is left for the child to report.
-        assert_eq!(resolve("go", "sdk/none"), std::path::PathBuf::from("go"));
+        // A `go` reached only through a relative or empty entry, a directory
+        // of the checkout mise runs in, is never run, and neither is a bare
+        // `go` left for the OS to look up.
+        for path in ["sdk/go/bin", "sdk/go/bin:/nonexistent", ":/nonexistent"] {
+            let err = try_resolve("go", path).unwrap_err().to_string();
+            assert!(err.contains("not found in an absolute PATH entry"), "{err}");
+        }
+        assert!(go_program(OsStr::new("go"), &BTreeMap::new()).is_err());
 
         // What `go` starts searches only the absolute entries: the relative
         // ones, and the empty one POSIX reads as the current directory, would
@@ -2046,7 +2136,7 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(program)
             .env_clear()
-            .env("PATH", search(path))
+            .env("PATH", search("/usr/bin:sdk/go/bin::"))
             .current_dir(elsewhere.path())
             .output()
             .unwrap();
@@ -2054,6 +2144,29 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "755 /usr/bin"
         );
+    }
+
+    /// A `go` at a relative path names a file of the checkout mise runs in,
+    /// on every platform: the lookup takes the bare name instead, which only
+    /// absolute PATH entries can answer, and `go_list` never runs it.
+    #[test]
+    fn a_relative_go_is_never_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let env = BTreeMap::from([("PATH".to_string(), bin.to_string_lossy().into_owned())]);
+        for found in ["bin/go", "./go", "../checkout/bin/go"] {
+            assert_eq!(lookup_go_program(found.into()), "go", "{found}");
+            let err = go_program(OsStr::new(found), &env).unwrap_err().to_string();
+            assert!(err.contains("not an absolute path"), "{err}");
+        }
+        // An absolute path and a bare name pass through.
+        let absolute = bin.join("go").into_os_string();
+        assert_eq!(lookup_go_program(absolute.clone()), absolute);
+        assert_eq!(go_program(&absolute, &env).unwrap(), absolute);
+        assert_eq!(lookup_go_program("go".into()), "go");
+        assert!(is_bare_program_name(std::path::Path::new("go")));
+        assert!(!is_bare_program_name(std::path::Path::new("")));
     }
 
     #[cfg(windows)]
@@ -2065,11 +2178,30 @@ mod tests {
             std::fs::create_dir_all(cwd.join(dir)).unwrap();
             std::fs::write(cwd.join(dir).join(name), "").unwrap();
         }
-        let env = BTreeMap::from([("Path".to_string(), "scripts;sdk".to_string())]);
+        let abs = |dir: &str| cwd.join(dir).to_string_lossy().into_owned();
+        let env = BTreeMap::from([(
+            "Path".to_string(),
+            format!("{};{}", abs("scripts"), abs("sdk")),
+        )]);
         assert_eq!(
-            std::path::PathBuf::from(program_outside_cwd(OsStr::new("go"), &env, cwd)),
+            std::path::PathBuf::from(go_program(OsStr::new("go"), &env).unwrap()),
             cwd.join("sdk").join("go.exe")
         );
+        // Only absolute entries are searched.
+        let env = BTreeMap::from([("Path".to_string(), "scripts;sdk".to_string())]);
+        assert!(go_program(OsStr::new("go"), &env).is_err());
+        // What `spawn_program` finds through a relative entry of the PATH mise
+        // was started with is a checkout's file: the lookup drops it for the
+        // bare name, and `go_list` refuses it outright.
+        let env = BTreeMap::from([("Path".to_string(), abs("sdk"))]);
+        for found in [r"bin\go.exe", r".\go.exe", r"C:go.exe", r"\go.exe"] {
+            assert_eq!(lookup_go_program(found.into()), "go", "{found}");
+            assert!(go_program(OsStr::new(found), &env).is_err(), "{found}");
+        }
+        // The toolset's `go`, at an absolute path, is kept.
+        let toolset_go = cwd.join("sdk").join("go.exe").into_os_string();
+        assert_eq!(lookup_go_program(toolset_go.clone()), toolset_go);
+        assert_eq!(lookup_go_program("go.exe".into()), "go.exe");
         // The PATH `go` is given keeps its name and only its absolute entries.
         let env = BTreeMap::from([("Path".to_string(), r"scripts;C:\Go\bin;;sdk".to_string())]);
         let (key, search) = absolute_search_path(&env).unwrap();
@@ -3562,8 +3694,8 @@ mod tests {
         restrict_go_list_routes(&mut env);
         assert_eq!(env["GOPROXY"], "off");
 
-        // Without Go's answer, no route goes to `direct`, and the proxies
-        // stay in their order.
+        // Without Go's answer, no route goes to `direct`, and every proxy
+        // stays in the chain, in its order.
         let without_go = |goproxy: Option<&str>| {
             let mut env: BTreeMap<String, String> = goproxy
                 .map(|v| ("GOPROXY".to_string(), v.to_string()))
@@ -3573,12 +3705,72 @@ mod tests {
             assert!(!go_has_native_route(&env));
             env["GOPROXY"].clone()
         };
-        assert_eq!(without_go(None), "https://proxy.golang.org,off");
+        assert_eq!(without_go(None), "https://proxy.golang.org");
+        // A proxy after `direct` is still asked, and moves on as the entry
+        // before it says: past any error after `a`.
+        let chain = without_go(Some("https://a.example| direct ,https://b.example"));
+        assert_eq!(chain, "https://a.example|https://b.example");
+        let proxies = parse_goproxy_value(&chain);
+        let urls: Vec<_> = proxies.iter().map(|p| p.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.example", "https://b.example"]);
+        assert_eq!(proxies[0].fall_through, FallThrough::OnAnyError);
         assert_eq!(
-            without_go(Some("https://a.example| direct ,https://b.example")),
-            "https://a.example|off,https://b.example"
+            without_go(Some("direct,file:///cache|https://b.example,direct")),
+            "file:///cache|https://b.example"
+        );
+        assert_eq!(
+            without_go(Some("https://a.example,off")),
+            "https://a.example,off"
         );
         assert_eq!(without_go(Some("direct")), "off");
+        assert_eq!(without_go(Some("direct|direct")), "off");
+    }
+
+    /// The guard that keeps a lookup off `direct` without Go's answer does not
+    /// change which cache entry is read or whether the versions host lists
+    /// the tool: those follow the user's settings.
+    #[test]
+    fn routing_unknown_to_go_keeps_the_users_cache_and_versions_host() {
+        let saved_off = || {
+            Some(BTreeMap::from([
+                ("GOPROXY".to_string(), "off".to_string()),
+                ("GOPRIVATE".to_string(), String::new()),
+                ("GONOPROXY".to_string(), String::new()),
+            ]))
+        };
+        // Go not installed and nothing set: the default routing, which the
+        // versions host serves under the shared cache entry.
+        assert_eq!(
+            go_routing_cache_context(&user_go_routing(BTreeMap::new(), None)),
+            None
+        );
+        // ... though the lookup itself goes nowhere near `direct`.
+        let mut lookup = BTreeMap::new();
+        apply_go_routing(&mut lookup, None);
+        assert_eq!(lookup["GOPROXY"], "https://proxy.golang.org");
+        // A setting of the user's still makes a context of its own, whether
+        // it is in mise's environment or saved with `go env -w`.
+        let corp = BTreeMap::from([(
+            "GOPROXY".to_string(),
+            "https://corp.example,direct".to_string(),
+        )]);
+        let corp_context = go_routing_cache_context(&user_go_routing(corp.clone(), None));
+        assert!(corp_context.is_some());
+        assert_eq!(
+            corp_context,
+            go_routing_cache_context(&user_go_routing(
+                BTreeMap::new(),
+                Some(BTreeMap::from([
+                    (
+                        "GOPROXY".to_string(),
+                        "https://corp.example,direct".to_string()
+                    ),
+                    ("GOPRIVATE".to_string(), String::new()),
+                    ("GONOPROXY".to_string(), String::new()),
+                ]))
+            ))
+        );
+        assert!(go_routing_cache_context(&user_go_routing(corp, saved_off())).is_some());
     }
 
     #[cfg(unix)]
@@ -3602,7 +3794,9 @@ mod tests {
 echo '{"GONOPROXY": "", "GOPRIVATE": "", "GOPROXY": "off"}'"#,
         );
         let env = BTreeMap::from([("GOPROXY".to_string(), "direct".to_string())]);
-        let routing = effective_go_routing(go.as_os_str(), &env).await.unwrap();
+        let routing = effective_go_routing(go.as_os_str(), &env, NO_DEADLINE)
+            .await
+            .unwrap();
         assert_eq!(routing["GOPROXY"], "off");
 
         // A `go` that cannot answer leaves the settings unknown.
@@ -3610,7 +3804,70 @@ echo '{"GONOPROXY": "", "GOPRIVATE": "", "GOPROXY": "off"}'"#,
             "broken-go",
             "echo 'go: reading go env file: bad line' >&2; exit 1",
         );
-        assert_eq!(effective_go_routing(broken.as_os_str(), &env).await, None);
+        assert_eq!(
+            effective_go_routing(broken.as_os_str(), &env, NO_DEADLINE).await,
+            None
+        );
+
+        // So does one that hangs, at the deadline rather than never.
+        let hung = script("hung-go", "exec sleep 600");
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            effective_go_routing(hung.as_os_str(), &env, std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("the deadline ends the wait");
+        assert_eq!(answer, None);
+    }
+
+    /// The `go` asked for the routing settings is found as `go list` finds
+    /// it: in the absolute PATH entries, never in a checkout's directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn go_routing_settings_never_come_from_a_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = tempfile::tempdir().unwrap();
+        let marker = work.path().join("ran");
+        let bin = work.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let go = bin.join("go");
+        std::fs::write(
+            &go,
+            format!(
+                "#!/bin/sh\n: > '{}'\necho '{{\"GONOPROXY\": \"\", \"GOPRIVATE\": \"\", \"GOPROXY\": \"direct\"}}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Reached through a relative entry, read against the directory mise
+        // runs in, this `go` would be the checkout's. It is not run, and the
+        // settings are unknown.
+        let cwd = std::env::current_dir().unwrap();
+        let relative = format!(
+            "{}{}",
+            "../".repeat(cwd.components().count() - 1),
+            bin.strip_prefix("/").unwrap().display()
+        );
+        assert!(cwd.join(&relative).join("go").is_file());
+        for path in [relative, String::new()] {
+            let env = BTreeMap::from([("PATH".to_string(), path)]);
+            assert_eq!(
+                effective_go_routing(OsStr::new("go"), &env, NO_DEADLINE).await,
+                None
+            );
+        }
+        assert!(!marker.exists(), "a go on a relative PATH entry ran");
+
+        // Through an absolute entry, it answers.
+        let env = BTreeMap::from([("PATH".to_string(), bin.to_string_lossy().into_owned())]);
+        let routing = effective_go_routing(OsStr::new("go"), &env, NO_DEADLINE)
+            .await
+            .unwrap();
+        assert_eq!(routing["GOPROXY"], "direct");
+        assert!(marker.exists());
     }
 
     /// A `file://` entry keeps its place in the chain, as Go asks it.
