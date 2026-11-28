@@ -4887,6 +4887,31 @@ GNOME Terminal and Ptyxis, and not to Alacritty, WezTerm or kitty.
 env = "MISE_TERMINAL_PROGRESS"
 type = "Bool"
 
+[tool_request_limit]
+default = 1000
+description = "How many tool versions a config file, and the config files together, may request."
+docs = """
+mise resolves every tool version the config files request each time it builds
+the toolset, which under `mise activate` is on every prompt. `.tool-versions`,
+idiomatic version files and plain `[tools]` entries load without trust, so a
+checkout could otherwise make each prompt take seconds or gigabytes of memory
+with a file that asks for a huge number of versions.
+
+A config file that requests more than this many tool versions fails to load,
+and `mise use` refuses to save one. When the files together request more, the
+closest files win and mise ignores the tools that would take the count over,
+with a warning. A tool's versions count only in the highest-priority file that
+names it. Real configs request tens of versions.
+
+Raise it if a setup of yours legitimately requests more. `0` means no limit; a
+negative value keeps the default of 1000, with a warning.
+This setting is only read from the environment and the global config, so a
+project's `mise.toml` cannot raise it.
+"""
+env = "MISE_TOOL_REQUEST_LIMIT"
+global_only = true
+type = "Integer"
+
 [tool_update.check_duration]
 default = "24h"
 description = "How often mise checks for a newer version of a global tool that sets `auto_update = true`, or of every global tool with `tool_update.global_auto = true`."

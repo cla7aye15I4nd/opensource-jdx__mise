@@ -749,6 +749,8 @@ impl Backend for NodePlugin {
     async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let contents = file::read_to_string(path)?;
         let body = normalize_idiomatic_contents(&contents);
+        // Counted before any version is allocated: the file can be megabytes of short lines.
+        crate::config::config_file::ensure_tool_request_count(path, body.lines().count())?;
 
         let versions = body
             .lines()

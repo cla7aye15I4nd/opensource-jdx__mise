@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Every tool version the config files request is resolved on each prompt, and
+# `.tool-versions` loads without trust, so mise refuses a config file that
+# requests more than `tool_request_limit` versions. Only the environment and
+# the global config may change the limit: a project cannot raise its own.
+
+echo 'dummy 1 2 3' >.tool-versions
+assert_contains "mise ls dummy" "1"
+
+assert_fail "MISE_TOOL_REQUEST_LIMIT=2 mise ls" "requests 3 tool versions, a config file may request 2"
+assert_fail "MISE_TOOL_REQUEST_LIMIT=2 mise ls" "tool_request_limit"
+
+cat <<'EOF' >"$MISE_CONFIG_DIR/config.toml"
+[settings]
+tool_request_limit = 2
+EOF
+assert_fail "mise ls" "requests 3 tool versions, a config file may request 2"
+
+# A trusted project's own settings cannot raise the limit.
+cat <<'EOF' >mise.toml
+[settings]
+tool_request_limit = 0
+EOF
+mise trust mise.toml
+assert_contains "mise settings get tool_request_limit 2>&1" "ignored for security reasons"
+assert_fail "mise ls" "requests 3 tool versions, a config file may request 2"
+
+# 0 means no limit, from the global config or the environment.
+cat <<'EOF' >"$MISE_CONFIG_DIR/config.toml"
+[settings]
+tool_request_limit = 0
+EOF
+assert_contains "mise ls dummy" "1"
+assert_contains "MISE_TOOL_REQUEST_LIMIT=0 mise ls dummy" "1"
+
+# An idiomatic version file is counted before its versions are built, and one
+# over the limit is refused rather than skipped.
+rm .tool-versions mise.toml
+printf '20\n22\n24\n' >.nvmrc
+export MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node
+assert_contains "mise ls node" "20"
+assert_fail "MISE_TOOL_REQUEST_LIMIT=2 mise ls" "requests 3 tool versions, a config file may request 2"
+
+# Only 0 lifts the limit: a negative value keeps the default with a warning.
+unset MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS
+rm "$MISE_CONFIG_DIR/config.toml"
+assert_contains "MISE_TOOL_REQUEST_LIMIT=-1 mise ls 2>&1" "tool_request_limit is -1, using 1000; set it to 0 for no limit"

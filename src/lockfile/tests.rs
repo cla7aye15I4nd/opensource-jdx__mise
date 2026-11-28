@@ -1532,55 +1532,72 @@ fn test_locked_backends_are_memoized_per_generation() {
     let finds = AtomicUsize::new(0);
     let find = |backend: &str| {
         finds.fetch_add(1, Ordering::Relaxed);
-        Some(backend.to_string())
+        locked_tool(backend)
     };
-    let key = || ("node".to_string(), Some("22".to_string()));
+    let backend = |tool: Arc<LockedTool>, version| tool.backend(version);
 
     for _ in 0..3 {
-        let found = memoized_locked_backend(&memo, 0, key(), || find("core:node"));
-        assert_eq!(found.as_deref(), Some("core:node"));
+        let found = memoized_locked_tool(&memo, 0, "node", || find("core:node"));
+        assert_eq!(backend(found, Some("22")).as_deref(), Some("core:node"));
     }
     assert_eq!(finds.load(Ordering::Relaxed), 1);
 
-    // Another version is another answer.
-    let other = ("node".to_string(), None);
-    assert_eq!(
-        memoized_locked_backend(&memo, 0, other, || find("aqua:nodejs/node")).as_deref(),
-        Some("aqua:nodejs/node")
-    );
+    // Another version of the tool reuses the same scan of its entries.
+    let found = memoized_locked_tool(&memo, 0, "node", || find("aqua:nodejs/node"));
+    assert_eq!(backend(found, None).as_deref(), Some("core:node"));
+    assert_eq!(finds.load(Ordering::Relaxed), 1);
+
+    // Another tool is another answer.
+    let found = memoized_locked_tool(&memo, 0, "hk", || find("aqua:jdx/hk"));
+    assert_eq!(backend(found, None).as_deref(), Some("aqua:jdx/hk"));
     assert_eq!(finds.load(Ordering::Relaxed), 2);
 
     // An invalidation drops every answer from before it.
-    let found = memoized_locked_backend(&memo, 1, key(), || find("aqua:nodejs/node"));
-    assert_eq!(found.as_deref(), Some("aqua:nodejs/node"));
+    let found = memoized_locked_tool(&memo, 1, "node", || find("aqua:nodejs/node"));
+    assert_eq!(backend(found, None).as_deref(), Some("aqua:nodejs/node"));
     assert_eq!(finds.load(Ordering::Relaxed), 3);
 
     // A caller that started before that invalidation gets its own answer, but
     // does not put it back.
-    let stale = memoized_locked_backend(&memo, 0, key(), || find("core:node"));
-    assert_eq!(stale.as_deref(), Some("core:node"));
-    let found = memoized_locked_backend(&memo, 1, key(), || find("core:node"));
-    assert_eq!(found.as_deref(), Some("aqua:nodejs/node"));
+    let stale = memoized_locked_tool(&memo, 0, "node", || find("core:node"));
+    assert_eq!(backend(stale, None).as_deref(), Some("core:node"));
+    let found = memoized_locked_tool(&memo, 1, "node", || find("core:node"));
+    assert_eq!(backend(found, None).as_deref(), Some("aqua:nodejs/node"));
     assert_eq!(finds.load(Ordering::Relaxed), 4);
 }
 
 #[test]
 fn test_lookup_during_an_invalidation_is_not_kept() {
     let memo = Mutex::new(LockedBackends::default());
-    let key = || ("node".to_string(), None);
 
     // A lookup that starts while the caches are being cleared reads the
     // generation then and may read a lockfile from before the clear.
     advance_generation_after(|| {
         let during = CACHE_GENERATION.load(Ordering::SeqCst);
-        let stale = memoized_locked_backend(&memo, during, key(), || Some("core:node".into()));
-        assert_eq!(stale.as_deref(), Some("core:node"));
+        let stale = memoized_locked_tool(&memo, during, "node", || locked_tool("core:node"));
+        assert_eq!(stale.backend(None).as_deref(), Some("core:node"));
     });
 
     // Once the invalidation returns, that answer is gone.
     let after = CACHE_GENERATION.load(Ordering::SeqCst);
-    let found = memoized_locked_backend(&memo, after, key(), || Some("aqua:nodejs/node".into()));
-    assert_eq!(found.as_deref(), Some("aqua:nodejs/node"));
+    let found = memoized_locked_tool(&memo, after, "node", || locked_tool("aqua:nodejs/node"));
+    assert_eq!(found.backend(None).as_deref(), Some("aqua:nodejs/node"));
+}
+
+/// A tool locked once, at version 1, under `backend`.
+fn locked_tool(backend: &str) -> LockedTool {
+    let entry = LockfileTool {
+        version: "1".to_string(),
+        backend: Some(backend.to_string()),
+        specifiers: BTreeSet::new(),
+        options: BTreeMap::new(),
+        platforms: BTreeMap::new(),
+        aube: None,
+        uv: None,
+        provenance: None,
+        unsupported_platforms: Default::default(),
+    };
+    LockedTool::new(&[&entry])
 }
 
 #[test]
@@ -3138,6 +3155,15 @@ fn locked_backend_inherits_only_an_unambiguous_backend() {
     );
     assert_eq!(locked_backend(&split, Some("2.0.0")), None);
     assert_eq!(locked_backend(&split, None).as_deref(), Some("aqua:jdx/hk"));
+
+    // The memoized form answers every question the same way.
+    let none: [&LockfileTool; 0] = [];
+    for entries in [&one_backend[..], &split[..], &none[..]] {
+        let tool = LockedTool::new(entries);
+        for version in [None, Some("1.57.0"), Some("1.58.1"), Some("2.0.0")] {
+            assert_eq!(tool.backend(version), locked_backend(entries, version));
+        }
+    }
 }
 
 #[test]
@@ -4067,6 +4093,53 @@ backend = "conda:jq"
     );
 
     let _ = std::fs::remove_file(&test_lockfile);
+}
+
+/// Inline `"platforms.<name>"` keys are split off a tool entry wherever they
+/// sit in it: the keys around them are still read, and an inline key wins over
+/// the same platform in a nested `platforms` table.
+#[test]
+fn test_inline_platform_keys_parsing() {
+    let value: toml::Value = toml::from_str(
+        r#"
+"platforms.linux-x64" = { checksum = "sha256:inline" }
+version = "1.0.0"
+"platforms.macos-arm64" = "sha256:string"
+backend = "aqua:example/tool"
+"platforms.windows-x64" = { url = "https://example.com/tool.zip" }
+options = { exe = "tool" }
+
+[platforms.linux-x64]
+checksum = "sha256:nested"
+
+[platforms.linux-arm64]
+checksum = "sha256:nested-only"
+"#,
+    )
+    .unwrap();
+
+    let tool = LockfileTool::try_from(value).unwrap();
+
+    assert_eq!(tool.version, "1.0.0");
+    assert_eq!(tool.backend.as_deref(), Some("aqua:example/tool"));
+    assert_eq!(tool.options.get("exe").map(String::as_str), Some("tool"));
+    assert_eq!(
+        tool.platforms.keys().collect::<Vec<_>>(),
+        ["linux-arm64", "linux-x64", "macos-arm64", "windows-x64"]
+    );
+    let checksum = |platform: &str| tool.platforms[platform].checksum.as_deref();
+    assert_eq!(checksum("linux-x64"), Some("sha256:inline"));
+    assert_eq!(checksum("linux-arm64"), Some("sha256:nested-only"));
+    assert_eq!(checksum("macos-arm64"), Some("sha256:string"));
+    assert_eq!(
+        tool.platforms["windows-x64"].url.as_deref(),
+        Some("https://example.com/tool.zip")
+    );
+
+    // A malformed inline platform is still an error, not a skipped key.
+    let value: toml::Value =
+        toml::from_str("version = \"1.0.0\"\n\"platforms.linux-x64\" = 1\n").unwrap();
+    assert!(LockfileTool::try_from(value).is_err());
 }
 
 /// Lockfiles written while the pkgx backend existed must still load, and
@@ -6332,6 +6405,38 @@ backend = "conda:jq"
             .get_conda_package("macos-arm64", "ncurses-6.4-h7ea286d_0")
             .is_some()
     );
+}
+
+/// Telling whether a lock entry's backend is usable constructs that backend,
+/// and a tool can have an entry for every version it locks.
+#[test]
+fn usable_lock_entries_asks_once_per_distinct_backend() {
+    let mut project = Lockfile::default();
+    let entries = (0..300)
+        .map(|i| {
+            let backend = if i % 2 == 0 { "aqua:a/b" } else { "core:gone" };
+            basic_tool(&format!("1.0.{i}"), backend)
+        })
+        .collect();
+    project.tools.insert("tool".to_string(), entries);
+    let lockfiles = [Arc::new(Lockfile::default()), Arc::new(project)];
+
+    let mut asked = vec![];
+    let found = usable_lock_entries(&lockfiles, "tool", |full| {
+        asked.push(full.to_string());
+        full == "aqua:a/b"
+    })
+    .unwrap();
+    assert_eq!(asked, ["aqua:a/b", "core:gone"]);
+    assert_eq!(found.len(), 150);
+    assert!(
+        found
+            .iter()
+            .all(|t| t.backend.as_deref() == Some("aqua:a/b"))
+    );
+    assert_eq!(found[0].version, "1.0.0");
+
+    assert!(usable_lock_entries(&lockfiles, "tool", |_| false).is_none());
 }
 
 /// A tool version marked by an install that downloaded its artifact from

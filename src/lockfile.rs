@@ -71,12 +71,57 @@ pub(crate) struct LockfileDiscovery {
     locked_backends: Mutex<LockedBackends>,
 }
 
-/// Locked backends by tool and requested version, as the lockfiles read at
-/// [`CACHE_GENERATION`] `generation` recorded them.
+/// Locked backends by tool, as the lockfiles read at [`CACHE_GENERATION`]
+/// `generation` recorded them. A tool's entries are scanned once, however
+/// many of its versions are asked about.
 #[derive(Default)]
 struct LockedBackends {
     generation: u64,
-    by_tool: HashMap<(String, Option<String>), Option<String>>,
+    by_tool: HashMap<String, Arc<LockedTool>>,
+}
+
+/// What a tool's lock entries say about its backend, for any requested version;
+/// see [`locked_backend`].
+#[derive(Debug, Default)]
+struct LockedTool {
+    /// The first entry's backend, for a request without a version.
+    first: Option<String>,
+    /// The backend every entry shares, for a version that has no entry.
+    shared: Option<String>,
+    /// The first entry's backend for each locked version.
+    by_version: HashMap<String, Option<String>>,
+}
+
+impl LockedTool {
+    fn new(entries: &[&LockfileTool]) -> Self {
+        let first = entries.first().and_then(|tool| tool.backend.clone());
+        let shared = entries
+            .iter()
+            .all(|tool| tool.backend == first)
+            .then(|| first.clone())
+            .flatten();
+        let mut by_version = HashMap::new();
+        for tool in entries {
+            by_version
+                .entry(tool.version.clone())
+                .or_insert_with(|| tool.backend.clone());
+        }
+        Self {
+            first,
+            shared,
+            by_version,
+        }
+    }
+
+    fn backend(&self, version: Option<&str>) -> Option<String> {
+        let Some(version) = version else {
+            return self.first.clone();
+        };
+        match self.by_version.get(version) {
+            Some(backend) => backend.clone(),
+            None => self.shared.clone(),
+        }
+    }
 }
 
 /// Counts [`invalidate_caches`] calls, so answers derived from cached lockfiles
@@ -2014,10 +2059,6 @@ impl Fields {
 
     fn contains_key(&self, key: &str) -> bool {
         self.0.iter().any(|(name, _)| name == key)
-    }
-
-    fn keys(&self) -> impl Iterator<Item = &String> {
-        self.0.iter().map(|(name, _)| name)
     }
 }
 
@@ -7919,77 +7960,86 @@ pub(crate) fn get_locked_backend_for_version(
     // only after it clears the caches, so an answer stored under this
     // generation never comes from caches an invalidation after it dropped.
     let generation = CACHE_GENERATION.load(Ordering::SeqCst);
-    memoized_locked_backend(
-        &discovery.locked_backends,
-        generation,
-        (short.to_string(), version.map(str::to_string)),
-        || find_locked_backend_for_version(config, short, version),
-    )
+    memoized_locked_tool(&discovery.locked_backends, generation, short, || {
+        find_locked_tool(config, short)
+    })
+    .backend(version)
 }
 
-/// The answer `memo` holds for `key` at `generation`, or `find`'s, which is
+/// The answer `memo` holds for `short` at `generation`, or `find`'s, which is
 /// kept unless the memo already moved on to a later generation.
-fn memoized_locked_backend(
+fn memoized_locked_tool(
     memo: &Mutex<LockedBackends>,
     generation: u64,
-    key: (String, Option<String>),
-    find: impl FnOnce() -> Option<String>,
-) -> Option<String> {
+    short: &str,
+    find: impl FnOnce() -> LockedTool,
+) -> Arc<LockedTool> {
     {
         let memo = memo.lock().unwrap_or_else(|e| e.into_inner());
         if memo.generation == generation
-            && let Some(found) = memo.by_tool.get(&key)
+            && let Some(found) = memo.by_tool.get(short)
         {
             return found.clone();
         }
     }
-    let found = find();
+    let found = Arc::new(find());
     let mut memo = memo.lock().unwrap_or_else(|e| e.into_inner());
     if memo.generation < generation {
         memo.by_tool.clear();
         memo.generation = generation;
     }
     if memo.generation == generation {
-        memo.by_tool.insert(key, found.clone());
+        memo.by_tool.insert(short.to_string(), found.clone());
     }
     found
 }
 
-/// [`get_locked_backend_for_version`] without the memo.
-fn find_locked_backend_for_version(
-    config: &Config,
-    short: &str,
-    version: Option<&str>,
-) -> Option<String> {
+/// The lock entries [`get_locked_backend_for_version`] decides by, without the memo.
+fn find_locked_tool(config: &Config, short: &str) -> LockedTool {
     // Discovery includes parent lockfiles and runs before registry fallback.
     // A recorded backend must not revive a disabled backend for a shorthand,
     // and one mise cannot construct must not hide a usable entry, the same
     // test lockfile resolution applies to its candidates. A removed backend is
     // kept, so the tool fails with the removal error instead of quietly
     // installing from whatever backend the registry names.
-    let usable = |tool: &&LockfileTool| {
-        tool.backend.as_ref().is_some_and(|full| {
-            backend::removed_backend_error(full).is_some()
-                || backend::arg_to_backend(BackendArg::new(full.clone(), Some(full.clone())))
-                    .is_some_and(|backend| !backend::is_disabled_backend_type(&backend.get_type()))
-        })
+    let usable = |full: &str| {
+        backend::removed_backend_error(full).is_some()
+            || backend::arg_to_backend(BackendArg::new(full.to_string(), Some(full.to_string())))
+                .is_some_and(|backend| !backend::is_disabled_backend_type(&backend.get_type()))
     };
-    // The lockfile with the highest precedence that locks the tool decides
-    // alone: a global or parent lockfile already on another backend must not
-    // override or split a project's entries.
     let lockfiles = read_lockfiles_by_precedence(config);
-    let entries = lockfiles
+    usable_lock_entries(&lockfiles, short, usable)
+        .map(|entries| LockedTool::new(&entries))
+        .unwrap_or_default()
+}
+
+/// The entries of `short` in the lockfile with the highest precedence that
+/// has any whose backend is `usable`: a global or parent lockfile already on
+/// another backend must not override or split a project's entries.
+///
+/// `usable` constructs a backend, and a tool can have an entry per version
+/// locked, so it is asked once per distinct backend.
+fn usable_lock_entries<'a>(
+    lockfiles: &'a [Arc<Lockfile>],
+    short: &str,
+    mut usable: impl FnMut(&str) -> bool,
+) -> Option<Vec<&'a LockfileTool>> {
+    let mut known: HashMap<&str, bool> = HashMap::new();
+    lockfiles
         .iter()
         .map(|lockfile| {
             lockfile
                 .tools_for(short)
                 .into_iter()
                 .flatten()
-                .filter(usable)
+                .filter(|tool| {
+                    tool.backend
+                        .as_deref()
+                        .is_some_and(|full| *known.entry(full).or_insert_with(|| usable(full)))
+                })
                 .collect::<Vec<_>>()
         })
-        .find(|entries| !entries.is_empty())?;
-    locked_backend(&entries, version)
+        .find(|entries| !entries.is_empty())
 }
 
 /// Which of a tool's lock entries decides its backend. Without a `version`,
@@ -7998,6 +8048,9 @@ fn find_locked_backend_for_version(
 /// locked backend only when the tool is locked under one backend, and entries
 /// that already split versions across backends leave the choice to the
 /// registry.
+///
+/// A direct search for a single question; [`LockedTool`] answers the same for
+/// many versions of one tool.
 fn locked_backend(entries: &[&LockfileTool], version: Option<&str>) -> Option<String> {
     let Some(version) = version else {
         return entries.first().and_then(|tool| tool.backend.clone());
@@ -8139,16 +8192,15 @@ impl TryFrom<toml::Value> for LockfileTool {
                     }
                 }
                 // Handle inline table format: "platforms.linux-x64" = { ... }
-                let platform_keys: Vec<_> = t
-                    .keys()
-                    .filter(|k| k.starts_with("platforms."))
-                    .cloned()
-                    .collect();
-                for key in platform_keys {
-                    if let Some(platform_info) = t.remove(&key) {
-                        let platform_name = key.strip_prefix("platforms.").unwrap().to_string();
-                        platforms.insert(platform_name, PlatformInfo::try_from(platform_info)?);
-                    }
+                // The fields keep their order, so removing a key shifts every
+                // later one: they are split in one pass instead.
+                let (inline_platforms, rest): (Vec<_>, Vec<_>) =
+                    t.0.into_iter()
+                        .partition(|(key, _)| key.starts_with("platforms."));
+                let mut t = Fields(rest);
+                for (key, platform_info) in inline_platforms {
+                    let platform_name = key.strip_prefix("platforms.").unwrap().to_string();
+                    platforms.insert(platform_name, PlatformInfo::try_from(platform_info)?);
                 }
                 let mut options = BTreeMap::new();
                 if let Some(opts) = t.remove("options") {

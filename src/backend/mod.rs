@@ -5946,6 +5946,9 @@ pub trait Backend: Debug + Send + Sync {
         } else {
             self._parse_idiomatic_file_with_options(path).await?
         };
+        // Each version gets its own copy of the options, so a file over the limit is refused
+        // before they are copied.
+        crate::config::config_file::ensure_tool_request_count(path, versions.len())?;
         let options = self.ba().opts();
         versions
             .into_iter()
@@ -5999,6 +6002,11 @@ pub trait Backend: Debug + Send + Sync {
         if normalized.is_empty() {
             return Ok(vec![]);
         }
+        // Counted before any version is allocated: the file can be megabytes of short tokens.
+        crate::config::config_file::ensure_tool_request_count(
+            path,
+            normalized.split_whitespace().count(),
+        )?;
         Ok(normalized
             .split_whitespace()
             .map(|s| s.to_string())

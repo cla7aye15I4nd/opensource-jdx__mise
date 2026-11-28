@@ -112,6 +112,132 @@ fn ensure_versions_are_not_templates(
     Ok(())
 }
 
+/// The most tool versions a config file, and the config files together, may request: the
+/// `tool_request_limit` setting, with `0` for no limit.
+///
+/// `.tool-versions`, idiomatic version files and plain `[tools]` entries load without trust, and
+/// every request is resolved whenever the toolset is built (on each prompt under `mise activate`),
+/// which costs far more time and memory than the few bytes it takes to write one. Real configs
+/// name tens of tools, mise's own about thirty; the default of 1000 leaves room for far larger
+/// ones while keeping the cost of a hostile file to a fraction of a second. The setting is
+/// global-only, so a project cannot raise it for itself.
+fn max_tool_requests() -> usize {
+    const DEFAULT: usize = 1000;
+    match Settings::get().tool_request_limit {
+        0 => usize::MAX,
+        // Only `0` lifts the limit: a negative value is a mistake, not a request for no bound.
+        limit if limit < 0 => {
+            warn_once!("tool_request_limit is {limit}, using {DEFAULT}; set it to 0 for no limit");
+            DEFAULT
+        }
+        limit => usize::try_from(limit).unwrap_or(usize::MAX),
+    }
+}
+
+/// A config file that requests more tool versions than [`max_tool_requests`] allows. It has its
+/// own type so a caller that skips a plugin's parse error still refuses the file.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{path} requests {count} tool versions, a config file may request {limit}; \
+     raise the tool_request_limit setting to allow more"
+)]
+pub(crate) struct TooManyToolRequests {
+    path: String,
+    count: usize,
+    limit: usize,
+}
+
+/// Refuse a config file that requests more than [`max_tool_requests`] tool versions, before any
+/// of the requests is built.
+pub(crate) fn ensure_tool_request_count(path: &Path, count: usize) -> Result<()> {
+    let limit = max_tool_requests();
+    if count > limit {
+        return Err(TooManyToolRequests {
+            path: display_path(path),
+            count,
+            limit,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The same bound on what the config files request together: each can stay below it and name
+/// other tools, and the toolset is what they add up to.
+///
+/// What is bounded is the requests that take effect. A config file's list for a tool replaces
+/// the lists of lower-priority files for that tool, so the files are given from the highest
+/// priority down and [`Self::add`] drops the tools a closer file already named before counting.
+/// Past the bound, the closer files win: the tools that would take the count over, and every
+/// file below them, are left out with a warning rather than refused. The config still loads, so
+/// `mise use` and `mise unuse` can still fix it, and the requests that are built stay bounded.
+#[derive(Debug)]
+pub(crate) struct EffectiveToolRequests {
+    named: HashSet<Arc<BackendArg>>,
+    count: usize,
+    limit: usize,
+    full: bool,
+}
+
+impl Default for EffectiveToolRequests {
+    fn default() -> Self {
+        Self {
+            named: HashSet::new(),
+            count: 0,
+            limit: max_tool_requests(),
+            full: false,
+        }
+    }
+}
+
+impl EffectiveToolRequests {
+    /// Drop from `tools` the tools a higher-priority file named, and those that would take the
+    /// count over [`max_tool_requests`]; count the rest.
+    pub(crate) fn add<V>(
+        &mut self,
+        path: &Path,
+        tools: &mut IndexMap<Arc<BackendArg>, V>,
+        requests: impl Fn(&V) -> usize,
+    ) {
+        tools.retain(|ba, _| !self.named.contains(ba));
+        let mut ignored = 0;
+        tools.retain(|ba, v| {
+            let n = requests(v);
+            if self.full || self.count.saturating_add(n) > self.limit {
+                self.full = true;
+                ignored += n;
+                return false;
+            }
+            self.count += n;
+            self.named.insert(ba.clone());
+            true
+        });
+        if ignored > 0 {
+            self.warn_over_bound(path, &format!("{ignored} tool versions"));
+        }
+    }
+
+    /// Whether the bound is reached, so the files below need not be built: check before
+    /// building a file's requests, and [`Self::skip`] it if so.
+    pub(crate) fn is_full(&self) -> bool {
+        self.full
+    }
+
+    /// Leave out a file below the bound, with a warning.
+    pub(crate) fn skip(&self, path: &Path) {
+        self.warn_over_bound(path, "its tools");
+    }
+
+    fn warn_over_bound(&self, path: &Path, what: &str) {
+        warn_once!(
+            "ignoring {what} in {}: the config files request more than {} tool versions together; \
+             raise the tool_request_limit setting to allow more",
+            display_path(path),
+            self.limit
+        );
+    }
+}
+
 /// A templated tool entry's options as written and as the config that declares them renders
 /// them, so a rewrite can put the template back in place of the value it rendered to.
 #[derive(Debug, Clone)]
@@ -1035,7 +1161,11 @@ fn is_trusted_without_config_paths(
     if !content_bound && let Some(parent) = canonicalized_path.parent() {
         let mut current = parent;
         while let Some(dir) = current.parent() {
-            let monorepo_marker = with_appended_extension(&trust_path(dir), "monorepo");
+            // `dir` is an ancestor of a canonical path, so it is canonical.
+            let monorepo_marker = with_appended_extension(
+                &dirs::TRUSTED_CONFIGS.join(canonical_path_filename(dir)),
+                "monorepo",
+            );
             if monorepo_marker.exists() && is_trusted_with(dir, content_bound) {
                 add_trusted(canonicalized_path.to_path_buf());
                 return true;
@@ -1551,6 +1681,14 @@ fn hashed_path_filename(path: &Path) -> String {
         .canonicalize()
         .or_else(|_| std::path::absolute(path))
         .unwrap_or_else(|_| path.to_path_buf());
+    canonical_path_filename(&canonicalized_path)
+}
+
+/// [`hashed_path_filename`] of a path that is already canonical, such as an
+/// ancestor of a canonical path. Canonicalizing walks every component, so
+/// checking each ancestor of a deep path that way costs the square of its
+/// depth.
+fn canonical_path_filename(canonicalized_path: &Path) -> String {
     let hash = hash_to_str(&canonicalized_path);
     let trunc_str = |s: &OsStr| {
         let mut s = s.to_string_lossy().to_string();
@@ -2031,6 +2169,97 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn only_tool_requests_that_take_effect_count_toward_the_bound() {
+        let _settings = crate::test::SettingsGuard::lock();
+        let files = |sizes: &[(&str, usize)]| {
+            sizes
+                .iter()
+                .map(|(tool, n)| (Arc::new(BackendArg::from(*tool)), vec![(); *n]))
+                .collect::<IndexMap<_, _>>()
+        };
+        let path = Path::new("mise.toml");
+        // What each file keeps, and the total.
+        let total = |stack: &[&[(&str, usize)]]| {
+            let mut effective = EffectiveToolRequests::default();
+            let kept = stack
+                .iter()
+                .map(|file| {
+                    if effective.is_full() {
+                        return vec![];
+                    }
+                    let mut tools = files(file);
+                    effective.add(path, &mut tools, Vec::len);
+                    tools.keys().map(|ba| ba.short.clone()).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            (kept, effective.count)
+        };
+
+        // a project replaces the 600 node versions two parents request
+        let parents: &[&[(&str, usize)]] = &[&[("node", 1)], &[("node", 600)], &[("python", 500)]];
+        assert_eq!(total(parents).1, 501);
+        let at_limit: &[&[(&str, usize)]] = &[&[("node", 600)], &[("python", 400)]];
+        assert_eq!(total(at_limit).1, 1000);
+        // past the bound the closer files win, and nothing below the bound is kept
+        let spread: &[&[(&str, usize)]] = &[
+            &[("node", 600)],
+            &[("ruby", 1), ("python", 401), ("go", 1)],
+            &[("deno", 1)],
+        ];
+        let (kept, count) = total(spread);
+        assert_eq!(count, 601);
+        assert_eq!(kept, [vec!["node"], vec!["ruby"], vec![]]);
+
+        let mut effective = EffectiveToolRequests::default();
+        let mut lower = files(&[("python", 3), ("node", 2)]);
+        effective.add(path, &mut files(&[("node", 1)]), Vec::len);
+        effective.add(path, &mut lower, Vec::len);
+        assert_eq!(
+            lower.keys().map(|ba| ba.short.as_str()).collect::<Vec<_>>(),
+            ["python"]
+        );
+        assert!(effective.named.contains(&BackendArg::from("node")));
+    }
+
+    /// The `tool_request_limit` setting moves the bound for a file and for the files together,
+    /// and `0` lifts it.
+    #[test]
+    fn the_tool_request_limit_setting_moves_the_bound() {
+        use confique::Layer;
+        let _settings = crate::test::SettingsGuard::lock();
+        let set_limit = |limit| {
+            let mut settings = crate::config::settings::SettingsPartial::empty();
+            settings.tool_request_limit = Some(limit);
+            Settings::reset(Some(settings));
+        };
+        let path = Path::new("mise.toml");
+        let node = || IndexMap::from([(Arc::new(BackendArg::from("node")), vec![(); 5])]);
+
+        set_limit(4);
+        let err = ensure_tool_request_count(path, 5).unwrap_err().to_string();
+        assert!(err.contains("may request 4"), "{err}");
+        assert!(err.contains("tool_request_limit"), "{err}");
+        let mut effective = EffectiveToolRequests::default();
+        let mut tools = node();
+        effective.add(path, &mut tools, Vec::len);
+        assert!(tools.is_empty() && effective.is_full());
+
+        set_limit(-1);
+        let err = ensure_tool_request_count(path, 1001)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may request 1000"), "{err}");
+
+        set_limit(0);
+        ensure_tool_request_count(path, 1_000_000).unwrap();
+        let mut effective = EffectiveToolRequests::default();
+        let mut tools = node();
+        effective.add(path, &mut tools, Vec::len);
+        assert_eq!(tools.len(), 1);
+        assert!(!effective.is_full());
+    }
 
     #[tokio::test]
     async fn test_detect_config_file_type() {

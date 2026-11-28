@@ -3676,6 +3676,11 @@
           "description": "Show install progress in the terminal window's own progress indicator, with OSC 9;4 escape sequences.",
           "type": "boolean"
         },
+        "tool_request_limit": {
+          "default": 1000,
+          "description": "How many tool versions a config file, and the config files together, may request.",
+          "type": "integer"
+        },
         "tool_update": {
           "type": "object",
           "unevaluatedProperties": false,
