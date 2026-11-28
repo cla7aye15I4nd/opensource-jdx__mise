@@ -413,6 +413,21 @@ impl ToolVersion {
         request: &ToolRequest,
         target: &PlatformTarget,
     ) -> Result<Option<Self>> {
+        Ok(Self::locked_entry_for_target(config, request, target)
+            .await?
+            .map(|lt| Self::from_lockfile(request.clone(), lt)))
+    }
+
+    /// The lockfile entry a locked install on `target` would take for
+    /// `request`, as [`Self::resolve_locked_for_target`] finds it: by its
+    /// binding, else by the version an alias in it means today (`lts` ->
+    /// `20`) or, for an alias, the tool's only entry. `None` when no entry
+    /// matches.
+    pub(crate) async fn locked_entry_for_target(
+        config: &Config,
+        request: &ToolRequest,
+        target: &PlatformTarget,
+    ) -> Result<Option<LockfileTool>> {
         let version = request.version();
         let (query, boundary, alias_resolved) = match request {
             ToolRequest::Prefix { prefix, .. } => (prefix.clone(), true, false),
@@ -428,9 +443,7 @@ impl ToolVersion {
                 (query.to_string(), boundary, resolved != version)
             }
         };
-        Ok(request
-            .lockfile_resolve_for_target(config, &query, boundary, alias_resolved, target)?
-            .map(|lt| Self::from_lockfile(request.clone(), lt)))
+        request.lockfile_resolve_for_target(config, &query, boundary, alias_resolved, target)
     }
 
     fn from_lockfile(mut request: ToolRequest, lt: LockfileTool) -> Self {
