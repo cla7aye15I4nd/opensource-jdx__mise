@@ -609,7 +609,7 @@ impl CondaBackend {
         let match_spec = self.exact_match_spec(&tv.version)?;
 
         ctx.pr.set_message("fetching repodata".to_string());
-        let raw_opts = tv.request.options();
+        let raw_opts = tv.request.options().literal();
         let opts = CondaOptions::new(&raw_opts);
         let records = self
             .solve_packages(vec![match_spec], Self::current_conda_platform()?, opts)
@@ -710,10 +710,11 @@ impl CondaBackend {
     /// The URL a locked install of a tool with `options` downloads `url`, a
     /// package URL from mise.lock, from: with the login of the tool's channel,
     /// which the lockfile leaves out, for a package on the channel's server, and
-    /// as it is otherwise.
+    /// as it is otherwise. The channel is read as plain text (`literal`), as
+    /// the install reads it.
     pub(crate) fn locked_download_url(options: &ToolVersionOptions, url: &str) -> String {
         match (
-            url::Url::parse(&CondaOptions::new(options).channel_name()),
+            url::Url::parse(&CondaOptions::new(&options.literal()).channel_name()),
             url::Url::parse(url),
         ) {
             (Ok(channel), Ok(parsed)) => with_login_of(parsed, &channel).to_string(),
@@ -1271,7 +1272,7 @@ impl CondaBackend {
         let tool_name = self.tool_name();
         let match_spec = self.exact_match_spec(&tv.version)?;
 
-        let raw_opts = tv.request.options();
+        let raw_opts = tv.request.options().literal();
         let opts = CondaOptions::new(&raw_opts);
         let records = self
             .solve_packages(vec![match_spec], platform, opts)
@@ -1356,12 +1357,15 @@ impl Backend for CondaBackend {
         request: &crate::toolset::ToolRequest,
         _target: &PlatformTarget,
     ) -> Result<BTreeMap<String, String>> {
-        let raw_opts = request.options();
+        let raw_opts = request.options().literal();
         Ok(CondaOptions::new(&raw_opts).lockfile_options())
     }
 
     async fn _list_remote_versions(&self, config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
-        let raw_opts = config.get_tool_opts_with_overrides(&self.ba).await?;
+        let raw_opts = config
+            .get_tool_opts_with_overrides(&self.ba)
+            .await?
+            .literal();
         let opts = CondaOptions::new(&raw_opts);
         let channel = opts.channel()?;
         let current_platform = Self::current_conda_platform()?;
@@ -1400,7 +1404,10 @@ impl Backend for CondaBackend {
     /// versions host's one list cannot describe, so conda lists from its
     /// channel and caches per channel and platform.
     async fn remote_version_cache_context(&self, config: &Arc<Config>) -> Result<Option<String>> {
-        let raw_opts = config.get_tool_opts_with_overrides(&self.ba).await?;
+        let raw_opts = config
+            .get_tool_opts_with_overrides(&self.ba)
+            .await?
+            .literal();
         let channel = CondaOptions::new(&raw_opts).channel_name();
         Ok(Some(format!(
             "{channel}@{}",
@@ -1439,7 +1446,7 @@ impl Backend for CondaBackend {
         let tool_name = self.tool_name();
         let match_spec = self.exact_match_spec(&tv.version)?;
 
-        let raw_opts = tv.request.options();
+        let raw_opts = tv.request.options().literal();
         let opts = CondaOptions::new(&raw_opts);
         let records = self
             .solve_packages(vec![match_spec], platform, opts)
@@ -1913,6 +1920,25 @@ mod tests {
         );
 
         assert_eq!(CondaOptions::new(&opts).channel_name(), "conda-forge");
+    }
+
+    /// A channel login a template substituted is stored with its template syntax escaped; a
+    /// locked download puts back the login as the user wrote it.
+    #[test]
+    fn locked_download_url_takes_the_literal_channel_login() {
+        let mut opts = ToolVersionOptions::default();
+        opts.opts.insert(
+            "channel".to_string(),
+            toml::Value::String(r#"https://user:pw{{ "{" }}@conda.example/main"#.to_string()),
+        );
+
+        let url = CondaBackend::locked_download_url(
+            &opts,
+            "https://conda.example/main/linux-64/zlib-1.3-h0_0.conda",
+        );
+        let url = url::Url::parse(&url).unwrap();
+        assert_eq!(url.username(), "user");
+        assert_eq!(url.password(), Some("pw%7B"));
     }
 
     #[test]
