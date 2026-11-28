@@ -207,9 +207,11 @@ assert "readlink ~/.local/tracked-subdir/tracked.conf" "$PWD/tracked-home/.confi
 
 # A source in a repository another user owns is refused by git's ownership
 # check, so commands in that repository's .git/config never run.
+# GIT_CONFIG_NOSYSTEM keeps a system-wide safe.directory = * (GitHub's Ubuntu
+# runner images set one in /etc/gitconfig) from waiving the check.
 git -C tracked-home config core.fsmonitor "touch $PWD/fsmonitor_ran #"
-assert_fail "GIT_TEST_ASSUME_DIFFERENT_OWNER=1 mise dotfiles status ~/.local/tracked-home" "dubious ownership"
-assert_fail "GIT_TEST_ASSUME_DIFFERENT_OWNER=1 mise dotfiles status ~/.local/tracked-subdir" "dubious ownership"
+assert_fail "GIT_CONFIG_NOSYSTEM=1 GIT_TEST_ASSUME_DIFFERENT_OWNER=1 mise dotfiles status ~/.local/tracked-home" "dubious ownership"
+assert_fail "GIT_CONFIG_NOSYSTEM=1 GIT_TEST_ASSUME_DIFFERENT_OWNER=1 mise dotfiles status ~/.local/tracked-subdir" "dubious ownership"
 assert_fail "test -e $PWD/fsmonitor_ran"
 git -C tracked-home config --unset core.fsmonitor
 
