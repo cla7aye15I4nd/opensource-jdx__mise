@@ -21,6 +21,12 @@ rustPlatform.buildRustPackage {
     git
   ] ++ lib.optionals stdenv.hostPlatform.isDarwin [ darwin.ps ];
   buildInputs = with pkgs; [
+    # Since nixpkgs 44cddf92c4 (2026-10-12), cargoSetupHook makes aws-lc-sys
+    # and zstd-sys link the system AWS-LC and zstd (AWS_LC_SYS_USE_SYSTEM=1,
+    # ZSTD_SYS_USE_PKG_CONFIG=1) instead of their vendored copies. The nixpkgs
+    # pinned in flake.lock predates that, but builds that follow a newer
+    # nixpkgs need both as inputs.
+    aws-lc
     bash
     coreutils
     direnv
@@ -28,6 +34,7 @@ rustPlatform.buildRustPackage {
     git
     gnused
     openssl
+    zstd
   ];
 
   LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
